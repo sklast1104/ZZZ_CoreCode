@@ -1,0 +1,454 @@
+﻿using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Playables;
+
+namespace JM.TimelineAction
+{
+    public class ActionCtrl : MonoBehaviour, INotificationReceiver
+    {
+        public ActionListSO actionList;
+        private Dictionary<string, ActionSO> ActionDict { get; set; }
+
+        private ActionSO _action;
+        public ActionSO Action => _action;
+        public ActionSO OverrideAction { get; set; }
+
+        public Func<ActionSO, bool> IsActionExecutable { get; set; }
+        public Action<ActionSO, string> OnExecuteAction { get; set; }
+        public Action<ActionArgs> OnSetActionArgs { get; set; }
+
+        public float Time { get; private set; }
+        public bool IsPlaying { get; private set; }
+        public float Speed
+        {
+            get => Animator.speed;
+            set => Animator.speed = value;
+        }
+
+        public bool EnableFinishTransition { get; set; } = true;
+
+        public Deque<InputBufferItem> InputBuffer { get; private set; } = new(128);
+
+        // 현재 눌려있는 커맨드 (Down에서 추가, Up에서 제거)
+        private readonly HashSet<EActionCommand> _heldCommands = new();
+        public bool IsCommandHeld(EActionCommand command) => _heldCommands.Contains(command);
+
+        public double GetCommandHeldDuration(EActionCommand command)
+        {
+            if (!_heldCommands.Contains(command)) return 0;
+            if (!_heldDownTime.TryGetValue(command, out double startTime)) return 0;
+            return UnityEngine.Time.timeAsDouble - startTime;
+        }
+
+        public struct InputBufferItem
+        {
+            public EActionCommand command;
+            public EActionCommandPhase phase;
+            public double time;
+            public bool used;
+        }
+
+        private Animator Animator { get; set; }
+
+        private bool playCalled = false;
+
+        private readonly List<ActionNotifyState> _enterTrackNotifyStates = new();
+
+        private readonly List<ActionNotify> _notifies = new();
+        private int _notifiesFront;
+
+        private readonly List<ActionNotifyState> _notifyStates = new();
+        private int _notifyStatesFront;
+
+        private readonly List<ActionNotifyState> _runningNotifyStates = new();
+
+        private Action _onFinish;
+
+        private void Awake()
+        {
+            Animator = GetComponent<Animator>();
+            Refresh();
+        }
+
+        public void Refresh()
+        {
+            if (actionList != null)
+                ActionDict = actionList.ActionDict;
+            else
+                Debug.LogWarning($"[ActionCtrl] {name}: actionList is null");
+        }
+
+        public bool TryGetAction(string actionName, out ActionSO action)
+        {
+            if (ActionDict != null && actionName != null && ActionDict.TryGetValue(actionName, out action)) return true;
+
+            action = null;
+            Debug.LogWarning($"{name} 액션 없음: {actionName}");
+            return false;
+        }
+
+        public bool IsActionExecutableInternal(string actionName)
+        {
+            if (!TryGetAction(actionName, out var action)) return false;
+
+            if (IsActionExecutable == null) return true;
+
+            return IsActionExecutable(action);
+        }
+
+        public void PlayActionFullName(string actionFullName, float fadeDuration = 0f, Action onFinish = null)
+        {
+            PlayAction(actionList.RemoveNamePrefix(actionFullName), fadeDuration, onFinish);
+        }
+
+        private void PlayActionInternal(ActionSO action, string actionName, float fadeDuration = 0f, Action onFinish = null)
+        {
+            playCalled = true;
+            _action = action;
+            OverrideAction = null;
+
+            ClearNotifies();
+            ClearNotifyStates();
+            CallEndAndClearRunningNotifyStates();
+
+            ActionUnpacker.Unpack(action, out _clip, _enterTrackNotifyStates, _notifyStates, _notifies);
+
+            Time = 0f;
+            IsPlaying = true;
+            _onFinish = onFinish;
+
+            OnExecuteAction?.Invoke(action, actionName);
+            OnSetActionArgs?.Invoke(action.actionArgs);
+
+            foreach (var notifyState in _enterTrackNotifyStates)
+            {
+                notifyState.NotifyBegin(this);
+                notifyState.NotifyEnd(this);
+            }
+            _enterTrackNotifyStates.Clear();
+
+            if (gameObject.activeInHierarchy)
+                Animator.CrossFadeInFixedTime(actionName, fadeDuration);
+        }
+
+        public void PlayAction(string actionName, float fadeDuration = 0f, Action onFinish = null)
+        {
+            if (!TryGetAction(actionName, out var action)) return;
+            PlayActionInternal(action, actionName, fadeDuration, onFinish);
+        }
+
+        #region Input Transition
+
+        private readonly Dictionary<EActionCommand, double> _heldDownTime = new();
+
+        public void InputCommand(EActionCommand command, EActionCommandPhase phase)
+        {
+            // Held 상태 추적: Down → 추가, Up → 제거
+            if (phase == EActionCommandPhase.Down)
+            {
+                _heldCommands.Add(command);
+                _heldDownTime[command] = UnityEngine.Time.timeAsDouble;
+            }
+            else if (phase == EActionCommandPhase.Up)
+            {
+                _heldCommands.Remove(command);
+            }
+
+            bool ok = false;
+            if (OverrideAction)
+            {
+                ok = InputCommand(OverrideAction, command, phase);
+            }
+            else if (_action)
+            {
+                ok = InputCommand(_action, command, phase);
+            }
+
+            double time = UnityEngine.Time.timeAsDouble;
+            const double dt = 1;
+            if (!ok)
+            {
+                InputBuffer.PushBack(new InputBufferItem
+                {
+                    command = command,
+                    phase = phase,
+                    time = time
+                });
+                // if (command == EActionCommand.Dodge && phase == EActionCommandPhase.Press)
+                // {
+                //     Debug.Log($"{name} InputCommand {command} {phase}, time: {Time} no transition");
+                // }
+            }
+            while (InputBuffer.TryPeekFront(out var item) &&
+                   item.time < time - dt)
+            {
+                InputBuffer.PopFront();
+            }
+        }
+
+        private bool InputCommand(ActionSO action, EActionCommand command, EActionCommandPhase phase)
+        {
+            var transition = GetExecutableCommandTransition(action, command, phase);
+            if (transition != null)
+            {
+                // Debug.Log($"{name} InputCommand {command} {phase} transition to {transition.actionName}");
+                PlayAction(transition.actionName, transition.fadeDuration);
+                return true;
+            }
+
+            foreach (var state in _runningNotifyStates)
+            {
+                if (state is CommandTransitionNotifyState transitionState)
+                {
+                    var commandTransition = transitionState.commandTransition;
+                    if (commandTransition.Check(command, phase) &&
+                        commandTransition.CheckModifier(this) &&
+                        IsActionExecutableInternal(commandTransition.actionName))
+                    {
+                        PlayAction(commandTransition.actionName, commandTransition.fadeDuration);
+                        return true;
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(action.inheritActionTransition)) return false;
+
+            var baseAction = ActionDict[action.inheritActionTransition];
+            transition = GetExecutableCommandTransition(baseAction, command, phase);
+            if (transition != null)
+            {
+                // Debug.Log($"{name} InputCommand {command} {phase} transition to {transition.actionName}");
+                PlayAction(transition.actionName, transition.fadeDuration);
+                return true;
+            }
+            return false;
+        }
+
+        private CommandTransitionInfo GetExecutableCommandTransition(
+            ActionSO action, EActionCommand command, EActionCommandPhase phase)
+        {
+            if (action.commandTransitions != null)
+            {
+                foreach (var transition in action.commandTransitions)
+                {
+                    if (transition.Check(command, phase) &&
+                        transition.CheckModifier(this) &&
+                        IsActionExecutableInternal(transition.actionName))
+                    {
+                        return transition;
+                    }
+                }
+            }
+            return null;
+        }
+
+        public void InputSignal(string signalName)
+        {
+            if (OverrideAction)
+            {
+                InputSignal(OverrideAction, signalName);
+            }
+            else if (_action)
+            {
+                InputSignal(_action, signalName);
+            }
+        }
+
+        private void InputSignal(ActionSO action, string signalName)
+        {
+            var transition = GetExecutableSignalTransition(action, signalName);
+            if (transition != null)
+            {
+                PlayAction(transition.actionName, transition.fadeDuration);
+            }
+
+            if (string.IsNullOrEmpty(_action.inheritActionTransition)) return;
+
+            var baseAction = ActionDict[_action.inheritActionTransition];
+            transition = GetExecutableSignalTransition(baseAction, signalName);
+            if (transition != null)
+            {
+                PlayAction(transition.actionName, transition.fadeDuration);
+            }
+        }
+
+        private SignalTransitionInfo GetExecutableSignalTransition(ActionSO action, string signalName)
+        {
+            if (action.signalTransitions != null)
+            {
+                foreach (var signalTransition in action.signalTransitions)
+                {
+                    if (signalTransition.Check(signalName) &&
+                        IsActionExecutableInternal(signalTransition.actionName))
+                    {
+                        return signalTransition;
+                    }
+                }
+            }
+            return null;
+        }
+
+        #endregion
+
+        #region Action Player
+        private AnimationClip _clip;
+
+        private void ClearNotifies()
+        {
+            _notifies.Clear();
+            _notifiesFront = 0;
+        }
+
+        private void ClearNotifyStates()
+        {
+            _notifyStates.Clear();
+            _notifyStatesFront = 0;
+        }
+
+        private void CallEndAndClearRunningNotifyStates()
+        {
+            foreach (var state in _runningNotifyStates)
+            {
+                state.NotifyEnd(this);
+            }
+            _runningNotifyStates.Clear();
+        }
+
+        public void Stop()
+        {
+            Debug.Log($"{name} Action Player Stop");
+            _clip = null;
+            Time = 0f;
+            IsPlaying = false;
+            ClearNotifies();
+            ClearNotifyStates();
+            CallEndAndClearRunningNotifyStates();
+            // _animator.enabled = false;
+        }
+
+        private void ProcessNotifies()
+        {
+            playCalled = false;
+            while (_notifyStatesFront < _notifyStates.Count && _notifyStates[_notifyStatesFront].start <= Time)
+            {
+                var state = _notifyStates[_notifyStatesFront];
+                _runningNotifyStates.Add(state);
+                state.NotifyBegin(this);
+                if (playCalled)
+                {
+                    return;
+                }
+                _notifyStatesFront++;
+            }
+
+            while (_notifiesFront < _notifies.Count && _notifies[_notifiesFront].time <= Time)
+            {
+                _notifies[_notifiesFront].Notify(this);
+                if (playCalled)
+                {
+                    return;
+                }
+                _notifiesFront++;
+            }
+
+            for (int i = 0; i < _runningNotifyStates.Count;)
+            {
+                var state = _runningNotifyStates[i];
+                if (state.start + state.length <= Time)
+                {
+                    _runningNotifyStates.RemoveAt(i);
+                    state.NotifyEnd(this);
+                    if (playCalled)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    i++;
+                }
+            }
+        }
+
+        private void Update()
+        {
+            if (IsPlaying)
+            {
+                Time += UnityEngine.Time.deltaTime * Speed;
+
+                ProcessNotifies();
+                if (playCalled)
+                {
+                    return;
+                }
+
+                if (Time > _clip.length)
+                {
+                    if (_action.isLoop)
+                    {
+                        if (_runningNotifyStates.Count > 0)
+                        {
+                            Debug.LogWarning($"Looping action reached end but still in notify state");
+                            foreach (var state in _runningNotifyStates)
+                            {
+                                state.NotifyEnd(this);
+                            }
+                        }
+                        _runningNotifyStates.Clear();
+
+                        Time -= _clip.length;
+                        _notifyStatesFront = 0;
+                        _notifiesFront = 0;
+
+                        ProcessNotifies();
+                        if (playCalled)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        playCalled = false;
+                        _onFinish?.Invoke();
+                        if (playCalled)
+                        {
+                            return;
+                        }
+                        if (EnableFinishTransition)
+                        {
+                            var finishTransition = _action.finishTransition;
+                            if (!string.IsNullOrEmpty(finishTransition.actionName))
+                            {
+                                PlayAction(finishTransition.actionName, finishTransition.fadeDuration);
+                            }
+                            else
+                            {
+                                Stop();
+                            }
+                        }
+                        else
+                        {
+                            Stop();
+                        }
+                    }
+                }
+
+                foreach (var state in _runningNotifyStates)
+                {
+                    state.NotifyTick(this, Time);
+                }
+            }
+        }
+
+        #endregion
+
+        public void OnNotify(Playable origin, INotification notification, object context)
+        {
+            // if (notification is ActionNotify actionNotify)
+            // {
+            //     Debug.Log($"{name} OnNotify name: {actionNotify.GetType().Name}, time: {origin.GetTime()}, isPlaying: {origin.GetGraph().IsPlaying()}");
+            // }
+        }
+    }
+}
